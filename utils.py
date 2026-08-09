@@ -98,14 +98,21 @@ def fill_mask_holes(mask):
     h, w = mask.shape
     flood_seed = np.zeros((h + 2, w + 2), dtype=np.uint8)
     inverted = cv2.bitwise_not(mask)
-    cv2.floodFill(inverted, flood_seed, (0, 0), 255)
-    return cv2.bitwise_or(mask, cv2.bitwise_not(inverted))
+    try:
+        # Some OpenCV builds/platforms may raise on floodFill; guard against that
+        cv2.floodFill(inverted, flood_seed, (0, 0), 255)
+        filled = cv2.bitwise_or(mask, cv2.bitwise_not(inverted))
+    except cv2.error:
+        # Fall back to the original mask if floodFill fails
+        filled = mask.copy()
+    return filled
 
 
 def keep_largest_component(mask):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # If no components (or only background), return the original mask unchanged
     if num_labels <= 1:
-        return np.zeros_like(mask)
+        return mask.copy()
     largest_idx = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
     result = np.zeros_like(mask)
     result[labels == largest_idx] = 255
@@ -149,12 +156,23 @@ def feather_mask(mask, blur_radius=15):
 
 
 def replace_background(frame, background, mask):
+    """
+    Replace cloak region in `frame` with `background` using a smooth alpha blend
+    derived from a feathered mask. This produces smoother edges and correct
+    color mixing compared to bitwise operations.
+    """
     feathered = feather_mask(mask, 15)
-    inv_feathered = cv2.bitwise_not(feathered)
-    bg_part = cv2.bitwise_and(background, background, mask=feathered)
-    fg_part = cv2.bitwise_and(frame, frame, mask=inv_feathered)
-    output = cv2.add(fg_part, bg_part)
 
+    # Convert to float and compute alpha in range [0,1]
+    alpha = (feathered.astype(np.float32) / 255.0)[:, :, None]
+    fg = frame.astype(np.float32)
+    bg = background.astype(np.float32)
+
+    blended = (fg * (1.0 - alpha) + bg * alpha).astype(np.uint8)
+    output = blended
+
+    # Preserve any strongly red residuals inside the region by sampling the
+    # existing output and replacing those pixels with the background.
     if np.any(mask):
         coords = cv2.findNonZero(mask)
         x, y, w, h = cv2.boundingRect(coords)
